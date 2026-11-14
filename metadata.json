@@ -1,0 +1,6 @@
+{
+  "name": "KusaQuiz",
+  "description": "A cozy grass-meadow interactive quiz generator powered by scientific spaced repetition, soothing music, and expressive celebratory companions.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
