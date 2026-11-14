@@ -6,13 +6,19 @@ export const MEADOW_BGM_PATH =
 /**
  * Hybrid audio engine:
  * - Loops the uploaded Chiikawa BGM .mp3 track via HTMLAudioElement
+ * - Automatically falls back to a soft synthesized Web Audio pentatonic meadow loop
+ *   if the static .mp3 asset is unavailable in external deployments
  * - Synthesizes instant custom chimes & fanfares for every milestone via Web Audio API
  */
 class MeadowSoundEngine {
   private ctx: AudioContext | null = null;
   private masterGain: GainNode | null = null;
   private sfxGain: GainNode | null = null;
+  private musicGain: GainNode | null = null;
   private bgmAudio: HTMLAudioElement | null = null;
+  private bgmAssetFailed = false;
+  private synthMusicTimer: number | null = null;
+  private synthStepIndex = 0;
 
   private settings: AudioSettings = {
     musicEnabled: false,
@@ -36,6 +42,10 @@ class MeadowSoundEngine {
       this.sfxGain = this.ctx.createGain();
       this.sfxGain.gain.value = 0.72;
       this.sfxGain.connect(this.masterGain);
+
+      this.musicGain = this.ctx.createGain();
+      this.musicGain.gain.value = 0.24;
+      this.musicGain.connect(this.masterGain);
     }
 
     if (this.ctx.state === 'suspended') {
@@ -46,15 +56,54 @@ class MeadowSoundEngine {
   }
 
   private ensureBgmAudio(): HTMLAudioElement | null {
-    if (typeof window === 'undefined' || typeof Audio === 'undefined') return null;
+    if (typeof window === 'undefined' || typeof Audio === 'undefined' || this.bgmAssetFailed) {
+      return null;
+    }
     if (!this.bgmAudio) {
       const audio = new Audio(MEADOW_BGM_PATH);
       audio.loop = true;
       audio.preload = 'auto';
       audio.volume = Math.min(1, Math.max(0, this.settings.volume * 0.65));
+      audio.addEventListener('error', () => {
+        this.bgmAssetFailed = true;
+        if (this.settings.musicEnabled) {
+          this.startAmbientSynthLoop();
+        }
+      });
       this.bgmAudio = audio;
     }
     return this.bgmAudio;
+  }
+
+  private startAmbientSynthLoop(): void {
+    if (typeof window === 'undefined' || this.synthMusicTimer !== null) return;
+    const ctx = this.ensureContext();
+    if (!ctx || !this.musicGain) return;
+
+    // Gentle C-major pentatonic meadow chord-arpeggio notes
+    const notes = [261.63, 329.63, 392.0, 523.25, 440.0, 392.0, 329.63, 293.66];
+    const playStep = () => {
+      if (!this.settings.musicEnabled) return;
+      const audioCtx = this.ensureContext();
+      if (!audioCtx || !this.musicGain) return;
+      const freq = notes[this.synthStepIndex % notes.length];
+      this.synthStepIndex += 1;
+      const now = audioCtx.currentTime;
+      this.scheduleTone(freq, now, 1.35, 'sine', 0.14, this.musicGain, 0.18);
+      if (this.synthStepIndex % 4 === 1) {
+        this.scheduleTone(freq * 0.5, now, 2.2, 'triangle', 0.08, this.musicGain, 0.25);
+      }
+    };
+
+    playStep();
+    this.synthMusicTimer = window.setInterval(playStep, 1150);
+  }
+
+  private stopAmbientSynthLoop(): void {
+    if (typeof window !== 'undefined' && this.synthMusicTimer !== null) {
+      window.clearInterval(this.synthMusicTimer);
+      this.synthMusicTimer = null;
+    }
   }
 
   public getSettings(): AudioSettings {
@@ -80,16 +129,32 @@ class MeadowSoundEngine {
   }
 
   public startMusic(): void {
-    const audio = this.ensureBgmAudio();
-    if (!audio) return;
-
     this.settings.musicEnabled = true;
+
+    if (this.bgmAssetFailed) {
+      this.startAmbientSynthLoop();
+      return;
+    }
+
+    const audio = this.ensureBgmAudio();
+    if (!audio) {
+      this.startAmbientSynthLoop();
+      return;
+    }
+
     audio.volume = Math.min(1, Math.max(0, this.settings.volume * 0.65));
 
     const playPromise = audio.play();
     if (playPromise && typeof playPromise.catch === 'function') {
-      playPromise.catch(() => {
-        // Ignore browser autoplay rejection gracefully; user toggle remains interactive
+      playPromise.catch((err) => {
+        // Fallback to ambient synth only when asset fails to load/decode (NotSupportedError),
+        // ignoring standard autoplay block errors until next user gesture.
+        if (err && typeof err === 'object' && (err as { name?: string }).name === 'NotSupportedError') {
+          this.bgmAssetFailed = true;
+          if (this.settings.musicEnabled) {
+            this.startAmbientSynthLoop();
+          }
+        }
       });
     }
   }
@@ -99,6 +164,7 @@ class MeadowSoundEngine {
     if (this.bgmAudio) {
       this.bgmAudio.pause();
     }
+    this.stopAmbientSynthLoop();
   }
 
   public playMilestone(milestone: SoundMilestone, forcePreview = false): void {

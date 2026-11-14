@@ -491,7 +491,8 @@ export const StudySession: React.FC<StudySessionProps> = ({
 
           {currentItem.card.formulaUsed && !revealed && revealedStepCount > 0 && (
             <p className="mt-2 font-mono text-xs text-[#3D4C3B]">
-              Formula: {currentItem.card.formulaUsed}
+              {currentItem.card.exerciseType === 'calculation' ? 'Formula: ' : 'Rule / Principle: '}
+              {currentItem.card.formulaUsed}
             </p>
           )}
 
@@ -665,7 +666,8 @@ export const StudySession: React.FC<StudySessionProps> = ({
                   <div className="rounded-2xl border border-[#DCE8D3] bg-[#F7FBF3] p-4">
                     {currentItem.card.formulaUsed && (
                       <p className="font-mono text-xs font-semibold text-[#1D593A]">
-                        Formula: {currentItem.card.formulaUsed}
+                        {currentItem.card.exerciseType === 'calculation' ? 'Formula: ' : 'Rule / Principle: '}
+                        {currentItem.card.formulaUsed}
                       </p>
                     )}
                     {currentItem.card.workedSteps && currentItem.card.workedSteps.length > 0 && (

@@ -5,15 +5,18 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import JSZip from 'jszip';
 import mammoth from 'mammoth';
 import { extractText } from 'unpdf';
-import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import type { ExerciseKind, StudyDomain } from './src/types/quiz';
 import {
   buildBalancedStudyExcerpt,
   buildStudyItemsFromDocumentText,
   cleanExtractedText,
   countWords,
+  detectDocumentLanguage,
   detectDocumentSections,
+  extractTextFromPptxXmlSlides,
   parseCsvToStudyPairs,
 } from './src/utils/documentParser';
 import {
@@ -21,11 +24,9 @@ import {
   detectMathDomainFromText,
 } from './src/utils/mathExerciseEngine';
 import {
-  FREE_TIER_TEXT_MODELS,
-  ModelCooldownTracker,
-  buildFriendlyQuotaMessage,
-  isQuotaOrRateError,
-} from './src/utils/geminiQuota';
+  ModelRouter,
+  buildFriendlyRateLimitMessage,
+} from './src/utils/modelRouter';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -66,72 +67,165 @@ async function safeUnlink(targetPath?: string | null) {
   }
 }
 
-const modelCooldownTracker = new ModelCooldownTracker();
+const modelRouter = new ModelRouter();
 
-function getGeminiClient(): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-    return null;
-  }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
-}
+const DOMAIN_LABELS: Record<StudyDomain, string> = {
+  quantitative_stem: 'Quantitative STEM & Calculations',
+  social_humanities: 'Social Sciences & Humanities',
+  applied_professional: 'Applied Law, Medicine & Case Protocols',
+  language_terminology: 'Languages & Specialized Terminology',
+};
 
-async function callGeminiWithFallback(
-  ai: GoogleGenAI,
-  buildParams: (model: string) => Omit<Parameters<GoogleGenAI['models']['generateContent']>[0], 'model'>
-): Promise<{
-  response: Awaited<ReturnType<GoogleGenAI['models']['generateContent']>> | null;
-  modelUsed: string | null;
-  quotaExhausted: boolean;
-}> {
-  const candidates = modelCooldownTracker.getAvailableModels(FREE_TIER_TEXT_MODELS);
-  if (candidates.length === 0) {
-    return { response: null, modelUsed: null, quotaExhausted: true };
-  }
+const VALID_DOMAINS = new Set<StudyDomain>([
+  'quantitative_stem',
+  'social_humanities',
+  'applied_professional',
+  'language_terminology',
+]);
 
-  let sawQuota = false;
-  for (const model of candidates) {
-    try {
-      const params = buildParams(model);
-      // Adjust MEDIUM thinking on flash-lite fallback to LOW for broad compatibility
-      const config =
-        model === 'gemini-3.1-flash-lite' &&
-        params.config?.thinkingConfig?.thinkingLevel === ThinkingLevel.MEDIUM
-          ? {
-              ...params.config,
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            }
-          : params.config;
+function classifyStudyDomainHeuristically(
+  text: string,
+  sectionTitles: string[],
+  topicHint: string
+): {
+  domain: StudyDomain;
+  language: string;
+  subject: string;
+  keyThemes: string[];
+  pedagogicalStrategy: string;
+} {
+  const combined = `${topicHint}\n${text}`;
+  const language = detectDocumentLanguage(combined);
+  const isVi = language === 'Vietnamese';
+  const mathSignal = detectMathDomainFromText(combined);
 
-      const response = await ai.models.generateContent({
-        ...params,
-        config,
-        model,
-      });
-      return { response, modelUsed: model, quotaExhausted: false };
-    } catch (err) {
-      if (isQuotaOrRateError(err)) {
-        sawQuota = true;
-        modelCooldownTracker.markQuotaExceeded(model, err);
-        continue;
-      }
-      const brief = err instanceof Error ? err.message.slice(0, 180) : 'Unexpected Gemini response error';
-      console.info(`Gemini fallback (${model}): ${brief}`);
+  let domain: StudyDomain = 'social_humanities';
+
+  if (mathSignal.isQuantHeavy) {
+    domain = 'quantitative_stem';
+  } else {
+    const appliedMatches =
+      combined.match(
+        /\b(statute|plaintiff|defendant|contract law|case law|clause|constitution|clinical|diagnosis|patient|dosage|protocol|symptom|triage|audit|compliance|bộ luật|pháp luật|luật pháp|luật sư|điều luật|hiến pháp|điều khoản|hợp đồng|nghị định|lâm sàng|chẩn đoán|phác đồ|bệnh nhân|nghiệp vụ)\b/gi
+      )?.length ?? 0;
+
+    const languageMatches =
+      combined.match(
+        /\b(vocabulary|grammar|conjugation|collocation|idiom|pronunciation|phonology|syntax|glossary|jlpt|ielts|hsk|từ vựng|ngữ pháp|thành ngữ|phiên âm|từ loại|ngữ nghĩa học)\b/gi
+      )?.length ?? 0;
+
+    const humanitiesMatches =
+      combined.match(
+        /\b(philosophy|history|sociology|literature|ideology|dialectic|epistemology|ontology|political economy|triết học|lịch sử|xã hội học|kinh tế chính trị|văn học|tư tưởng|duy vật|biện chứng|nhận thức luận|chân lý|quy luật lượng)\b/gi
+      )?.length ?? 0;
+
+    if (appliedMatches > humanitiesMatches && appliedMatches > languageMatches) {
+      domain = 'applied_professional';
+    } else if (languageMatches > humanitiesMatches && languageMatches >= 1) {
+      domain = 'language_terminology';
+    } else {
+      domain = 'social_humanities';
     }
   }
 
-  return {
-    response: null,
-    modelUsed: null,
-    quotaExhausted: sawQuota || modelCooldownTracker.areAllExhausted(FREE_TIER_TEXT_MODELS),
+  const cleanThemes = sectionTitles
+    .map((t) => t.trim())
+    .filter((t) => t && !/^(Overview|Section \d+)$/i.test(t))
+    .slice(0, 4);
+
+  const keyThemes = Array.from(
+    new Set([
+      ...mathSignal.detectedTopics,
+      ...cleanThemes,
+      ...(cleanThemes.length === 0 && mathSignal.detectedTopics.length === 0
+        ? isVi
+          ? ['Khái niệm trọng tâm', 'Phân tích bản chất']
+          : ['Core Concepts', 'Applied Reasoning']
+        : []),
+    ])
+  ).slice(0, 5);
+
+  const subject =
+    topicHint ||
+    mathSignal.detectedTopics[0] ||
+    cleanThemes[0] ||
+    (isVi ? 'Tổng hợp kiến thức' : 'Academic Study');
+
+  const strategies: Record<StudyDomain, { en: string; vi: string }> = {
+    quantitative_stem: {
+      en: 'Combine worked-example scaffolding with step-by-step calculation drills and formula checks.',
+      vi: 'Kết hợp bài mẫu từng bước với bài tập tính toán thực hành và kiểm tra công thức.',
+    },
+    social_humanities: {
+      en: 'Probe causal chains, compare schools of thought, and expose subtle conceptual distinctions.',
+      vi: 'Phân tích chuỗi nhân quả, so sánh các trường phái tư tưởng và nhận diện bẫy khái niệm.',
+    },
+    applied_professional: {
+      en: 'Test practical rule, legal article, or clinical protocol application through realistic mini-cases.',
+      vi: 'Rèn luyện vận dụng điều luật, quy tắc hoặc phác đồ qua các tình huống thực tế ngắn.',
+    },
+    language_terminology: {
+      en: 'Reinforce contextual usage, collocations, cloze recall, and precise term-definition mapping.',
+      vi: 'Củng cố cách dùng theo ngữ cảnh, kết hợp từ, điền khuyết và đối chiếu thuật ngữ chính xác.',
+    },
   };
+
+  return {
+    domain,
+    language,
+    subject,
+    keyThemes,
+    pedagogicalStrategy: isVi ? strategies[domain].vi : strategies[domain].en,
+  };
+}
+
+function getDomainSynthesisDirectives(domain: StudyDomain, count: number, language: string): string {
+  const langRule = `CRITICAL LANGUAGE MIRRORING RULE: The source material is written in "${language}". Every single field in your JSON ("title", "description", "subject", "prompt", "answer", all 3 "distractors", "acceptableAnswers", "hint", "explanation", "conceptTag", "formulaUsed", and every item in "workedSteps") MUST be written strictly in ${language}. Do NOT translate concepts into English unless the source itself is in English.`;
+
+  switch (domain) {
+    case 'quantitative_stem':
+      return `${langRule}
+
+DOMAIN DIRECTIVES (quantitative_stem):
+- At least 75% of the ${count} items MUST be concrete practical calculations or quantitative problem-solving drills (with numbers, equations, matrices, or datasets) directly reflecting the uploaded formulas/methods.
+- Use "exerciseType": "calculation" or "worked-example".
+- Keep "answer" concise and exact (e.g. "12", "3/4", "2x + 5") so numeric/algebraic grading works cleanly.
+- Provide "formulaUsed" (the governing formula/theorem) and "workedSteps" (3-5 exact intermediate calculation steps ending at "answer").
+- All 3 "distractors" must represent realistic calculation errors (sign error, missing factor, wrong substitution).`;
+
+    case 'social_humanities':
+      return `${langRule}
+
+DOMAIN DIRECTIVES (social_humanities):
+- Focus on causal-chain analysis, comparisons across schools of thought or historical periods, ideological/contextual nuances, and subtle conceptual traps — NEVER invent unrelated math or rote trivial fill-in-the-blanks.
+- Use "exerciseType": "conceptual" or "worked-example".
+- Keep "answer" concise and clear (1 to 10 words).
+- Set "formulaUsed" to "" (or the name of an explicit theoretical framework mentioned in the text).
+- Provide "workedSteps" (2-4 clear analytical reasoning steps connecting premises/context in the source to the conclusion).
+- All 3 "distractors" must be plausible theoretical misconceptions or swapped historical/philosophical positions.`;
+
+    case 'applied_professional':
+      return `${langRule}
+
+DOMAIN DIRECTIVES (applied_professional):
+- Build short, realistic scenario or case-study questions that require applying a rule, legal article, clinical criterion, or management/engineering protocol from the source text.
+- Use "exerciseType": "case-study" or "worked-example".
+- Keep "answer" concise and unambiguous (1 to 10 words).
+- Set "formulaUsed" to the specific rule, article, or protocol name if stated in the source (otherwise "").
+- Provide "workedSteps" (2-4 step-by-step decision reasoning steps showing how the rule applies to the scenario).
+- All 3 "distractors" must represent realistic procedural/legal/clinical misapplications.`;
+
+    case 'language_terminology':
+      return `${langRule}
+
+DOMAIN DIRECTIVES (language_terminology):
+- Focus on contextual usage, collocations, register distinctions, cloze-deletion sentences, and precise term-to-meaning mapping directly from the uploaded material.
+- Use "exerciseType": "language-usage" or "conceptual".
+- Keep "answer" concise and exact.
+- Set "formulaUsed" to the grammatical pattern or root structure if relevant (otherwise "").
+- Provide "workedSteps" (2-3 linguistic or contextual clues explaining why this choice fits).
+- All 3 "distractors" must be plausible semantic or grammatical near-misses.`;
+  }
 }
 
 async function extractDocumentFromPath(
@@ -155,51 +249,41 @@ async function extractDocumentFromPath(
       Array.isArray(pdfResult.text) ? pdfResult.text.join('\n\n') : String(pdfResult.text ?? '')
     );
 
-    // If scanned PDF with minimal selectable text and within inline payload budget, fall back to Gemini PDF OCR
-    if (countWords(extractedText) < 12) {
-      if (buffer.byteLength <= 18 * 1024 * 1024) {
-        const ai = getGeminiClient();
-        if (ai) {
-          const { response: pdfResponse } = await callGeminiWithFallback(ai, () => ({
-            contents: {
-              parts: [
-                {
-                  inlineData: {
-                    mimeType: 'application/pdf',
-                    data: buffer.toString('base64'),
-                  },
-                },
-                {
-                  text: 'Extract all readable study text, headings, definitions, and key points from this PDF in clean markdown paragraphs.',
-                },
-              ],
-            },
-            config: {
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            },
-          }));
-          const aiText = cleanExtractedText(pdfResponse?.text ?? '');
-          if (countWords(aiText) > countWords(extractedText)) {
-            extractedText = aiText;
-          }
-        }
-      } else {
-        throw new Error(
-          `"${fileName}" appears to be a large scanned-image PDF without embedded text. Please run OCR or split it into smaller PDFs under 18 MB.`
-        );
-      }
+    if (countWords(extractedText) < 10) {
+      throw new Error(
+        `"${fileName}" appears to be a scanned-image PDF without embedded selectable text. Please run OCR or export a text-searchable PDF before uploading.`
+      );
     }
   } else if (ext === '.docx') {
     fileType = 'DOCX';
     const result = await mammoth.extractRawText({ path: filePath });
     extractedText = cleanExtractedText(result.value ?? '');
+  } else if (ext === '.pptx') {
+    fileType = 'PPTX';
+    const buffer = await fs.promises.readFile(filePath);
+    const zip = await JSZip.loadAsync(buffer);
+    const slideNames = Object.keys(zip.files).filter((name) =>
+      /^ppt\/slides\/slide\d+\.xml$/i.test(name)
+    );
+    if (slideNames.length === 0) {
+      throw new Error(`No presentation slides were found inside "${fileName}".`);
+    }
+    const slidePayloads = await Promise.all(
+      slideNames.map(async (name) => ({
+        name,
+        xml: await zip.files[name].async('string'),
+      }))
+    );
+    const pptxResult = extractTextFromPptxXmlSlides(slidePayloads);
+    extractedText = pptxResult.text;
+    pageCount = pptxResult.slideCount > 0 ? pptxResult.slideCount : null;
   } else if (ext === '.txt' || ext === '.md' || ext === '.csv' || ext === '.json') {
     fileType = ext.replace('.', '').toUpperCase();
     const raw = await fs.promises.readFile(filePath, 'utf8');
     extractedText = cleanExtractedText(raw);
   } else {
     throw new Error(
-      `Unsupported file type "${ext || 'unknown'}" for "${fileName}". Supported formats: PDF (.pdf), Word (.docx), Markdown (.md), Text (.txt), CSV (.csv), and JSON (.json).`
+      `Unsupported file type "${ext || 'unknown'}" for "${fileName}". Supported formats: PDF (.pdf), Word (.docx), PowerPoint (.pptx), Markdown (.md), Text (.txt), CSV (.csv), and JSON (.json).`
     );
   }
 
@@ -210,8 +294,13 @@ async function extractDocumentFromPath(
   }
 
   const totalWords = countWords(extractedText);
+  const detectedLanguage = detectDocumentLanguage(extractedText);
   const rawSections = detectDocumentSections(extractedText);
-  // Keep every consolidated section crisp in JSON while preserving broad coverage across huge volumes
+  const chapterOutline = rawSections.map((s) => ({
+    id: s.id,
+    title: s.title,
+    wordCount: s.wordCount,
+  }));
   const sections = rawSections.map((sec) => ({
     ...sec,
     content: sec.content.length > 14000 ? `${sec.content.slice(0, 14000)}\n...` : sec.content,
@@ -226,9 +315,11 @@ async function extractDocumentFromPath(
     fileSizeBytes,
     wordCount: totalWords,
     pageCount,
+    detectedLanguage,
     extractedText: previewText,
     isPreviewTruncated: extractedText.length > previewLimit,
     sections,
+    chapterOutline,
     csvPairsCount: csvPairs.length,
   };
 }
@@ -238,21 +329,22 @@ async function startServer() {
   app.use(express.json({ limit: '24mb' }));
 
   app.get('/api/health', (_req, res) => {
+    const routerStatus = modelRouter.getStatusSummary();
     res.json({
       ok: true,
-      hasGeminiKey: Boolean(getGeminiClient()),
+      provider: 'github-models',
+      ...routerStatus,
       maxFileSizeMB: Math.round(MAX_SINGLE_FILE_BYTES / (1024 * 1024)),
       maxBatchFiles: MAX_BATCH_FILES,
     });
   });
 
-  // Backward-compatible single-file extraction endpoint (supports large files on disk)
   app.post('/api/files/extract', upload.single('file'), async (req, res) => {
     const file = req.file;
     try {
       if (!file) {
         return res.status(400).json({
-          error: 'Please select a file to upload (.pdf, .docx, .txt, .md, .csv, or .json).',
+          error: 'Please select a file to upload (.pdf, .docx, .pptx, .txt, .md, .csv, or .json).',
         });
       }
       const extracted = await extractDocumentFromPath(
@@ -266,6 +358,7 @@ async function startServer() {
       const status =
         message.startsWith('Unsupported file type') ||
         message.startsWith('Could not find readable text') ||
+        message.startsWith('No presentation slides') ||
         message.includes('scanned-image PDF')
           ? 400
           : 500;
@@ -276,13 +369,12 @@ async function startServer() {
     }
   });
 
-  // Multi-file batch extraction endpoint
   app.post('/api/files/extract-batch', upload.array('files', MAX_BATCH_FILES), async (req, res) => {
     const files = (Array.isArray(req.files) ? req.files : []) as Express.Multer.File[];
     try {
       if (files.length === 0) {
         return res.status(400).json({
-          error: 'Please select one or more files (.pdf, .docx, .txt, .md, .csv, or .json).',
+          error: 'Please select one or more files (.pdf, .docx, .pptx, .txt, .md, .csv, or .json).',
         });
       }
 
@@ -321,14 +413,18 @@ async function startServer() {
     }
   });
 
-  // Chunked upload part receiver for large files (>10 MB) so reverse proxies never reject large payloads
   app.post('/api/files/upload-chunk', chunkUpload.single('chunk'), async (req, res) => {
     const chunkFile = req.file;
     try {
       const uploadId = typeof req.body?.uploadId === 'string' ? req.body.uploadId.trim() : '';
       const chunkIndex = Number(req.body?.chunkIndex);
 
-      if (!chunkFile || !/^[a-zA-Z0-9_-]{8,64}$/.test(uploadId) || !Number.isInteger(chunkIndex) || chunkIndex < 0) {
+      if (
+        !chunkFile ||
+        !/^[a-zA-Z0-9_-]{8,64}$/.test(uploadId) ||
+        !Number.isInteger(chunkIndex) ||
+        chunkIndex < 0
+      ) {
         await safeUnlink(chunkFile?.path);
         return res.status(400).json({ error: 'Invalid upload chunk metadata.' });
       }
@@ -343,7 +439,6 @@ async function startServer() {
     }
   });
 
-  // Reassembles uploaded chunks on disk, parses the full large file, and deletes all temporary files
   app.post('/api/files/finalize-chunk', async (req, res) => {
     const uploadId = typeof req.body?.uploadId === 'string' ? req.body.uploadId.trim() : '';
     const fileName = typeof req.body?.fileName === 'string' ? req.body.fileName.trim() : 'document';
@@ -389,6 +484,7 @@ async function startServer() {
       const status =
         message.startsWith('Unsupported file type') ||
         message.startsWith('Could not find readable text') ||
+        message.startsWith('No presentation slides') ||
         message.includes('scanned-image PDF')
           ? 400
           : 500;
@@ -402,7 +498,9 @@ async function startServer() {
   app.post('/api/files/generate-study', async (req, res) => {
     try {
       const incomingFileNames: string[] = Array.isArray(req.body?.fileNames)
-        ? req.body.fileNames.filter((n: unknown): n is string => typeof n === 'string' && n.trim().length > 0)
+        ? req.body.fileNames.filter(
+            (n: unknown): n is string => typeof n === 'string' && n.trim().length > 0
+          )
         : [];
       const fallbackSingleName =
         typeof req.body?.fileName === 'string' && req.body.fileName.trim()
@@ -410,16 +508,15 @@ async function startServer() {
           : 'Uploaded Document';
       const fileNames = incomingFileNames.length > 0 ? incomingFileNames : [fallbackSingleName];
 
-      const incomingSections: Array<{ fileName?: string; title: string; content: string }> = Array.isArray(
-        req.body?.sections
-      )
-        ? req.body.sections.filter(
-            (s: unknown): s is { fileName?: string; title: string; content: string } =>
-              Boolean(s) &&
-              typeof (s as { content?: unknown }).content === 'string' &&
-              typeof (s as { title?: unknown }).title === 'string'
-          )
-        : [];
+      const incomingSections: Array<{ fileName?: string; title: string; content: string }> =
+        Array.isArray(req.body?.sections)
+          ? req.body.sections.filter(
+              (s: unknown): s is { fileName?: string; title: string; content: string } =>
+                Boolean(s) &&
+                typeof (s as { content?: unknown }).content === 'string' &&
+                typeof (s as { title?: unknown }).title === 'string'
+            )
+          : [];
 
       const text =
         incomingSections.length > 0
@@ -432,7 +529,9 @@ async function startServer() {
       const difficulty =
         typeof req.body?.difficulty === 'string' ? req.body.difficulty.trim() : 'Intermediate';
       const rawCount = Number(req.body?.count ?? 6);
-      const count = Number.isFinite(rawCount) ? Math.min(12, Math.max(3, Math.round(rawCount))) : 6;
+      const count = Number.isFinite(rawCount)
+        ? Math.min(12, Math.max(3, Math.round(rawCount)))
+        : 6;
 
       if (!text || countWords(text) < 3) {
         return res.status(400).json({
@@ -478,88 +577,75 @@ async function startServer() {
         }
       }
 
-      const ai = getGeminiClient();
-      if (ai) {
-        try {
-          const toolInstructions =
-            tool === 'flashcards'
-              ? `Build ${count} high-yield ACTIVE RECALL FLASHCARDS:
+      const detectedLanguage = detectDocumentLanguage(text);
+
+      if (modelRouter.hasConfiguredProvider()) {
+        const toolInstructions =
+          tool === 'flashcards'
+            ? `Build ${count} high-yield ACTIVE RECALL FLASHCARDS:
 - "prompt" is the front of the card (a focused question, term, or prompt).
 - "answer" is the concise back of the card (1 to 10 words).
-- Still provide 3 plausible "distractors" so the student can also switch to multiple-choice review later.`
-              : `Build ${count} INTERACTIVE QUIZ QUESTIONS at ${difficulty} level:
+- Provide 3 plausible "distractors" so the student can also switch to multiple-choice review later.`
+            : `Build ${count} INTERACTIVE QUIZ QUESTIONS at ${difficulty} level:
 - "prompt" tests comprehension or application of one atomic idea from the document(s).
 - "answer" is concise and unambiguous (1 to 8 words).
 - Provide 3 strong, realistic "distractors" rooted in related concepts from the reading.`;
 
-          const multiFileInstruction =
-            fileNames.length > 1
-              ? `Synthesize items evenly across all ${fileNames.length} uploaded files (${fileNames.join(', ')}) so concepts from every source appear.`
-              : `Ground every card strictly in "${fileNames[0]}".`;
+        const multiFileInstruction =
+          fileNames.length > 1
+            ? `Synthesize items evenly across all ${fileNames.length} uploaded files (${fileNames.join(', ')}) so concepts from every source appear.`
+            : `Ground every card strictly in "${fileNames[0]}".`;
 
-          const { response } = await callGeminiWithFallback(ai, () => ({
-            contents: `Read this student study material (${displaySourceLabel}) and create a spaced-repetition study deck.
+        const { data, modelUsed } = await modelRouter.generateJson<{
+          title?: string;
+          description?: string;
+          subject?: string;
+          cards?: Array<Record<string, unknown>>;
+        }>({
+          tier: 'fast',
+          systemPrompt:
+            'You are a universal educational architect creating concise, accurate spaced-repetition flashcards and quizzes grounded strictly in the uploaded document(s). Never invent external facts or inject unrelated math. Output valid JSON only.',
+          userPrompt: `Read this student study material (${displaySourceLabel}) and create a spaced-repetition study deck.
 ${multiFileInstruction}
 ${toolInstructions}
+
+LANGUAGE MIRRORING RULE: The material is primarily in "${detectedLanguage}". Write ALL fields ("title", "description", "subject", "prompt", "answer", "distractors", "acceptableAnswers", "hint", "explanation", "conceptTag") strictly in ${detectedLanguage}.
+
+Return JSON matching:
+{
+  "title": "string",
+  "description": "string",
+  "subject": "string",
+  "cards": [
+    {
+      "prompt": "string",
+      "answer": "string",
+      "distractors": ["string", "string", "string"],
+      "acceptableAnswers": ["string"],
+      "hint": "string",
+      "explanation": "string",
+      "conceptTag": "string"
+    }
+  ]
+}
 
 Document excerpt(s):
 """
 ${text.slice(0, 24000)}
 """`,
-            config: {
-              systemInstruction:
-                'You are an educational scientist creating concise, accurate spaced-repetition flashcards and quizzes grounded strictly in the uploaded document(s).',
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-              responseMimeType: 'application/json',
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                  title: { type: Type.STRING },
-                  description: { type: Type.STRING },
-                  subject: { type: Type.STRING },
-                  cards: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        prompt: { type: Type.STRING },
-                        answer: { type: Type.STRING },
-                        distractors: { type: Type.ARRAY, items: { type: Type.STRING } },
-                        acceptableAnswers: { type: Type.ARRAY, items: { type: Type.STRING } },
-                        hint: { type: Type.STRING },
-                        explanation: { type: Type.STRING },
-                        conceptTag: { type: Type.STRING },
-                      },
-                      required: [
-                        'prompt',
-                        'answer',
-                        'distractors',
-                        'acceptableAnswers',
-                        'hint',
-                        'explanation',
-                        'conceptTag',
-                      ],
-                    },
-                  },
-                },
-                required: ['title', 'description', 'subject', 'cards'],
-              },
-            },
-          }));
+        });
 
-          const rawText = (response?.text ?? '').trim();
-          if (rawText) {
-            const parsed = JSON.parse(rawText);
-            if (parsed && Array.isArray(parsed.cards) && parsed.cards.length > 0) {
-              return res.json({ ...parsed, tool, source: 'gemini-ai' });
-            }
-          }
-        } catch {
-          // Deterministic parser fallback below handles non-JSON responses silently
+        if (data && Array.isArray(data.cards) && data.cards.length > 0) {
+          return res.json({
+            ...data,
+            tool,
+            language: detectedLanguage,
+            source: modelUsed ?? 'github-models',
+          });
         }
       }
 
-      // Deterministic structure-based extractor when Gemini API key is unavailable or fails
+      // Multilingual deterministic parser fallback when API key is unavailable or rate-limited
       const fallbackCards = buildStudyItemsFromDocumentText(text, tool, count, baseName);
       if (fallbackCards.length === 0) {
         return res.status(400).json({
@@ -570,9 +656,13 @@ ${text.slice(0, 24000)}
 
       return res.json({
         title: `${baseName} (${tool === 'flashcards' ? 'Flashcards' : 'Quiz'})`,
-        description: `Built ${fallbackCards.length} ${tool} items directly from ${displaySourceLabel}.`,
-        subject: 'Document Study',
+        description:
+          detectedLanguage === 'Vietnamese'
+            ? `Tạo ${fallbackCards.length} thẻ ôn tập trực tiếp từ ${displaySourceLabel}.`
+            : `Built ${fallbackCards.length} ${tool} items directly from ${displaySourceLabel}.`,
+        subject: detectedLanguage === 'Vietnamese' ? 'Tài liệu học tập' : 'Document Study',
         tool,
+        language: detectedLanguage,
         source: 'document-structure',
         cards: fallbackCards,
       });
@@ -584,7 +674,8 @@ ${text.slice(0, 24000)}
     }
   });
 
-  // Multi-Agent SSE Pipeline: Analyzer Agent -> Google Search Research Agent -> Calculation Exercise & Verifier Agent
+  // Zero-Search Universal 4-Domain Multi-Agent Pipeline:
+  // Agent 1: Domain & Language Classifier (fast tier) -> Agent 2: Deep Synthesis & Verification (deep tier)
   app.post('/api/agents/build-quiz-stream', async (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -628,7 +719,7 @@ ${text.slice(0, 24000)}
 
       if (!excerptText || countWords(excerptText) < 2) {
         sendEvent('error', {
-          error: 'Please upload study files or enter a math/study topic before running AI Agents.',
+          error: 'Please upload study files or enter a study topic/notes before running AI Agents.',
         });
         return res.end();
       }
@@ -638,166 +729,97 @@ ${text.slice(0, 24000)}
           ? incomingFileNames.join(', ')
           : topic || 'Student Study Notes';
 
-      // --- AGENT 1: Content & Quantitative Skill Analyzer (Local Zero-Quota Classifier) ---
+      // --- AGENT 1: 4-Domain & Language Classifier Agent ---
       sendEvent('agent-step', {
-        agent: 'analyzer',
-        label: 'Content & Skill Analyzer Agent',
+        agent: 'classifier',
+        label: 'Domain & Language Classifier Agent',
         status: 'running',
-        detail: 'Scanning material for formulas, quantitative procedures, and key concepts...',
+        detail:
+          'Detecting academic domain (STEM, Humanities, Applied Case, Language) and document language...',
       });
 
-      const localMathSignal = detectMathDomainFromText(`${topic}\n${excerptText}`);
-      const sectionLabels = incomingSections
-        .map((s) => s.title.trim())
-        .filter((t) => t && !/^Document Section/i.test(t))
-        .slice(0, 4);
-      const detectedSkills = Array.from(
-        new Set([
-          ...localMathSignal.detectedTopics,
-          ...sectionLabels,
-          ...(localMathSignal.detectedTopics.length === 0 && sectionLabels.length === 0
-            ? ['Core Concept Recall', 'Applied Reasoning']
-            : []),
-        ])
-      ).slice(0, 5);
+      const sectionTitles = incomingSections.map((s) => s.title);
+      const heuristic = classifyStudyDomainHeuristically(excerptText, sectionTitles, topic);
+      let classification = { ...heuristic };
+      let classifierModelUsed: string | null = null;
 
-      const primarySubject =
-        localMathSignal.detectedTopics.length >= 2
-          ? `${localMathSignal.detectedTopics[0]} & ${localMathSignal.detectedTopics[1]}`
-          : localMathSignal.detectedTopics[0] ?? (topic || 'Applied Study');
+      if (modelRouter.hasConfiguredProvider()) {
+        const classifierRes = await modelRouter.generateJson<{
+          domain?: string;
+          language?: string;
+          subject?: string;
+          keyThemes?: string[];
+          pedagogicalStrategy?: string;
+        }>({
+          tier: 'fast',
+          temperature: 0.15,
+          maxTokens: 500,
+          systemPrompt:
+            'You are a universal academic curriculum classifier. Classify any study text into exactly one of 4 domains: "quantitative_stem", "social_humanities", "applied_professional", or "language_terminology", and detect its primary language accurately. Output JSON only.',
+          userPrompt: `Classify this study source strictly based on its own text (do NOT search external sources).
 
-      const domainAnalysis = {
-        isQuantHeavy: localMathSignal.isQuantHeavy,
-        subject: primarySubject,
-        skills: detectedSkills,
-        searchQueries: [
-          localMathSignal.isQuantHeavy
-            ? `${primarySubject} worked calculation exercises MIT OpenCourseWare Pauls Online Math Notes OpenStax`
-            : `${topic || sourceLabel} FSRS spaced repetition active recall study exercises`,
-        ],
-        pedagogicalPlan: localMathSignal.isQuantHeavy
-          ? 'Combine Worked Example Scaffolding with numerical calculation drills and step-by-step verification.'
-          : 'Combine atomic active recall questions with applied scenarios grounded in spaced repetition.',
-      };
+Source label: ${sourceLabel}
+Sample excerpt:
+"""
+${excerptText.slice(0, 4500)}
+"""
 
-      sendEvent('agent-step', {
-        agent: 'analyzer',
-        label: 'Content & Skill Analyzer Agent',
-        status: 'done',
-        detail: `${domainAnalysis.isQuantHeavy ? 'Quantitative/Calculation focus' : 'Conceptual & Applied focus'} · ${domainAnalysis.subject} (${domainAnalysis.skills.join(', ')})`,
-      });
+Return JSON:
+{
+  "domain": "quantitative_stem" | "social_humanities" | "applied_professional" | "language_terminology",
+  "language": "Primary language name, e.g. Vietnamese, English, Japanese, French",
+  "subject": "Concise subject title in the detected language",
+  "keyThemes": ["3 to 5 key themes in the detected language"],
+  "pedagogicalStrategy": "1 sentence explaining how to test mastery for this domain, written in the detected language"
+}`,
+        });
 
-      // --- AGENT 2: Search-Grounded Research Agent ---
-      sendEvent('agent-step', {
-        agent: 'search',
-        label: 'Search Research Agent',
-        status: 'running',
-        detail: `Searching well-known academic & algorithm references for ${domainAnalysis.subject}...`,
-      });
+        if (classifierRes.data) {
+          classifierModelUsed = classifierRes.modelUsed;
+          const rawDomain = classifierRes.data.domain as StudyDomain | undefined;
+          const validDomain =
+            rawDomain && VALID_DOMAINS.has(rawDomain) ? rawDomain : heuristic.domain;
+          // Preserve deterministic Vietnamese detection if heuristic detected Vietnamese unambiguously
+          const detectedLanguage =
+            heuristic.language === 'Vietnamese'
+              ? 'Vietnamese'
+              : typeof classifierRes.data.language === 'string' && classifierRes.data.language.trim()
+                ? classifierRes.data.language.trim()
+                : heuristic.language;
 
-      let researchNotes = domainAnalysis.pedagogicalPlan;
-      const researchSources: Array<{ title: string; url: string }> = [];
-      let quotaHitInPipeline = false;
-
-      const ai = getGeminiClient();
-      if (ai) {
-        try {
-          const searchPrompt = domainAnalysis.isQuantHeavy
-            ? `Search well-known university & educational math sources (such as MIT OpenCourseWare, OpenStax, Paul's Online Math Notes, Khan Academy) plus cognitive science adaptive practice algorithms (FSRS spaced repetition, Bayesian Knowledge Tracing, Worked Example Effect) for: ${domainAnalysis.searchQueries.join(' ; ')}. Summarize in 5 concise bullet points what calculation techniques, common student pitfalls, and progressive practical exercise formats are most effective for ${domainAnalysis.skills.join(', ')}.`
-            : `Search authoritative educational sources and spaced-repetition pedagogy (FSRS, SM-2, retrieval practice) for: ${domainAnalysis.searchQueries.join(' ; ')}. Summarize 4 concise principles and practical exercise patterns for ${domainAnalysis.skills.join(', ')}.`;
-
-          const { response: searchRes, quotaExhausted } = await callGeminiWithFallback(ai, () => ({
-            contents: searchPrompt,
-            config: {
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-              tools: [{ googleSearch: {} }],
-            },
-          }));
-          quotaHitInPipeline = quotaExhausted;
-
-          if (searchRes?.text && searchRes.text.trim()) {
-            researchNotes = searchRes.text.trim().slice(0, 3200);
-          }
-
-          const chunks =
-            searchRes?.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
-          const seenUrls = new Set<string>();
-          for (const chunk of chunks) {
-            const web = (chunk as { web?: { uri?: string; title?: string } }).web;
-            if (web?.uri && !seenUrls.has(web.uri)) {
-              seenUrls.add(web.uri);
-              researchSources.push({
-                title: web.title?.trim() || web.uri,
-                url: web.uri,
-              });
-            }
-          }
-        } catch {
-          // Handled cleanly via canonical sources below
+          classification = {
+            domain: validDomain,
+            language: detectedLanguage,
+            subject:
+              typeof classifierRes.data.subject === 'string' && classifierRes.data.subject.trim()
+                ? classifierRes.data.subject.trim()
+                : heuristic.subject,
+            keyThemes:
+              Array.isArray(classifierRes.data.keyThemes) && classifierRes.data.keyThemes.length > 0
+                ? classifierRes.data.keyThemes.map(String).slice(0, 5)
+                : heuristic.keyThemes,
+            pedagogicalStrategy:
+              typeof classifierRes.data.pedagogicalStrategy === 'string' &&
+              classifierRes.data.pedagogicalStrategy.trim()
+                ? classifierRes.data.pedagogicalStrategy.trim()
+                : heuristic.pedagogicalStrategy,
+          };
         }
       }
 
-      const usedLiveSearch = researchSources.length > 0;
-      if (!usedLiveSearch) {
-        const canonicalSources = domainAnalysis.isQuantHeavy
-          ? [
-              {
-                title: "Paul's Online Math Notes — Worked Calculus & Algebra Practice",
-                url: 'https://tutorial.math.lamar.edu/',
-              },
-              {
-                title: 'MIT OpenCourseWare — 18.01SC & 18.06SC Problem Sets & Exams',
-                url: 'https://ocw.mit.edu/courses/mathematics/',
-              },
-              {
-                title: 'OpenStax — Calculus & Linear Algebra Exercises',
-                url: 'https://openstax.org/subjects/math',
-              },
-              {
-                title: 'FSRS Algorithm & BKT Worked-Example Scaffolding Research',
-                url: 'https://github.com/open-spaced-repetition/fsrs4anki/wiki/The-Algorithm',
-              },
-            ]
-          : [
-              {
-                title: 'FSRS (Free Spaced Repetition Scheduler) — DSR Memory Model',
-                url: 'https://github.com/open-spaced-repetition/fsrs4anki/wiki/The-Algorithm',
-              },
-              {
-                title: 'MIT OpenCourseWare — Active Problem-Solving Collections',
-                url: 'https://ocw.mit.edu/',
-              },
-              {
-                title: 'OpenStax — Peer-Reviewed Study Exercises',
-                url: 'https://openstax.org/',
-              },
-            ];
-        researchSources.push(...canonicalSources);
-      }
-
       sendEvent('agent-step', {
-        agent: 'search',
-        label: 'Search Research Agent',
-        status: usedLiveSearch ? 'done' : 'fallback',
-        detail: usedLiveSearch
-          ? `Grounded in ${researchSources.length} verified Search references (${researchSources
-              .slice(0, 2)
-              .map((s) => s.title)
-              .join(', ')}${researchSources.length > 2 ? ', ...' : ''}).`
-          : quotaHitInPipeline
-            ? `Gemini free-tier quota reached — applied worked-example & FSRS/BKT scaffolding from ${researchSources.length} canonical academic sources.`
-            : `Applied worked-example & FSRS/BKT scaffolding referencing ${researchSources.length} canonical academic sources.`,
-        sources: researchSources.slice(0, 6),
+        agent: 'classifier',
+        label: 'Domain & Language Classifier Agent',
+        status: classifierModelUsed ? 'done' : 'fallback',
+        detail: `${DOMAIN_LABELS[classification.domain]} · Language: ${classification.language} · ${classification.subject} (${classification.keyThemes.join(', ')})`,
       });
 
-      // --- AGENT 3: Practical Exercise & Calculation Verifier Agent ---
+      // --- AGENT 2: Deep Synthesis & Verification Agent (Zero Web Search) ---
       sendEvent('agent-step', {
         agent: 'builder',
-        label: 'Calculation & Exercise Architect Agent',
+        label: 'Deep Synthesis & Verification Agent',
         status: 'running',
-        detail: domainAnalysis.isQuantHeavy
-          ? `Synthesizing ${count} practical calculation exercises with step-by-step worked solutions...`
-          : `Building ${count} skill-building practice items with worked rationales...`,
+        detail: `Synthesizing ${count} ${classification.language} study items tailored for ${DOMAIN_LABELS[classification.domain]}...`,
       });
 
       let builtPayload: {
@@ -812,144 +834,165 @@ ${text.slice(0, 24000)}
           hint: string;
           explanation: string;
           conceptTag: string;
-          exerciseType: 'conceptual' | 'calculation' | 'worked-example';
+          exerciseType: ExerciseKind;
           formulaUsed: string;
           workedSteps: string[];
         }>;
       } | null = null;
+      let builderModelUsed: string | null = null;
+      let rateLimitedFallback = false;
 
-      if (ai && !quotaHitInPipeline) {
-        try {
-          const mathDirectives = domainAnalysis.isQuantHeavy
-            ? `IMPORTANT FOR MATHEMATICS / QUANTITATIVE MATERIAL:
-- At least 75% of the ${count} items MUST be concrete PRACTICAL CALCULATION OR APPLIED PROBLEM-SOLVING EXERCISES (with specific numbers, functions, matrices, equations, or datasets) derived from the material's formulas & techniques—NOT mere vocabulary trivia!
-- Include a progressive blend of "worked-example" (scaffolding a core technique) and "calculation" (fresh problem with concrete numbers for the student to compute).
-- Keep "answer" concise and mathematically exact (e.g., "12", "3/4", "2x + 5", "14", "1/6") so automated numeric/fraction equivalence grading works cleanly.
-- Provide "formulaUsed" (the governing formula/theorem) and "workedSteps" (3-5 crisp step-by-step calculation lines showing exact intermediate arithmetic/algebra).`
-            : `Design ${count} applied skill-building exercises mixing practical scenarios, worked reasoning steps, and active recall. Include "workedSteps" (2-4 logical reasoning steps) and "formulaUsed" (key principle or rule if applicable, else empty string).`;
+      if (modelRouter.hasConfiguredProvider()) {
+        const directives = getDomainSynthesisDirectives(
+          classification.domain,
+          count,
+          classification.language
+        );
 
-          const { response: builderRes } = await callGeminiWithFallback(ai, () => ({
-            contents: `You are the Exercise Architect & Calculation Verifier Agent.
-Build exactly ${count} spaced-repetition practical exercises at ${difficulty} level.
+        const synthesisRes = await modelRouter.generateJson<{
+          title?: string;
+          description?: string;
+          subject?: string;
+          cards?: Array<Record<string, unknown>>;
+        }>({
+          tier: 'deep',
+          temperature: 0.35,
+          maxTokens: 3600,
+          systemPrompt: `You are a universal academic synthesis and verification architect covering Natural Sciences, Social Sciences, Humanities, Law, Medicine, and Languages. Ground 100% of every question, answer, distractor, and reasoning step strictly in the user's source material (${sourceLabel}) without external web search. Output strictly valid JSON.`,
+          userPrompt: `Build exactly ${count} spaced-repetition study items at ${difficulty} depth.
+
+Detected Domain: ${classification.domain} (${DOMAIN_LABELS[classification.domain]})
+Detected Language: ${classification.language}
+Pedagogical Strategy: ${classification.pedagogicalStrategy}
 
 Source Material (${sourceLabel}):
 """
-${excerptText.slice(0, 16000)}
+${excerptText.slice(0, 18000)}
 """
 
-Grounded Research Notes (Pedagogy & Canonical Patterns):
-"""
-${researchNotes}
-"""
+${directives}
 
-${mathDirectives}
-Double-check every calculation step and verify that "answer" matches the final line of "workedSteps", while all 3 "distractors" represent realistic calculation mistakes (e.g. sign error, missing chain-rule factor, swapped formula).`,
-            config: {
-              systemInstruction:
-                'You are an expert mathematics & STEM curriculum architect. Verify every numerical calculation carefully before outputting JSON.',
-              thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
-              responseMimeType: 'application/json',
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                  title: { type: Type.STRING },
-                  description: { type: Type.STRING },
-                  subject: { type: Type.STRING },
-                  cards: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        prompt: { type: Type.STRING },
-                        answer: { type: Type.STRING },
-                        distractors: { type: Type.ARRAY, items: { type: Type.STRING } },
-                        acceptableAnswers: { type: Type.ARRAY, items: { type: Type.STRING } },
-                        hint: { type: Type.STRING },
-                        explanation: { type: Type.STRING },
-                        conceptTag: { type: Type.STRING },
-                        exerciseType: { type: Type.STRING },
-                        formulaUsed: { type: Type.STRING },
-                        workedSteps: { type: Type.ARRAY, items: { type: Type.STRING } },
-                      },
-                      required: [
-                        'prompt',
-                        'answer',
-                        'distractors',
-                        'acceptableAnswers',
-                        'hint',
-                        'explanation',
-                        'conceptTag',
-                        'exerciseType',
-                        'formulaUsed',
-                        'workedSteps',
-                      ],
-                    },
-                  },
-                },
-                required: ['title', 'description', 'subject', 'cards'],
-              },
-            },
-          }));
+Self-verify before outputting JSON:
+1. Confirm every answer is strictly supported by the source material and matches the final line of "workedSteps".
+2. Confirm all 3 "distractors" are realistic and clearly distinct from "answer".
+3. Confirm ALL fields are written in ${classification.language}.
 
-          const rawJson = (builderRes?.text ?? '').trim();
-          if (rawJson) {
-            const parsed = JSON.parse(rawJson);
-            if (parsed && Array.isArray(parsed.cards) && parsed.cards.length > 0) {
-              builtPayload = {
-                title: parsed.title || `${domainAnalysis.subject} Practice Lab`,
-                description:
-                  parsed.description ||
-                  `AI-Agent verified ${parsed.cards.length} practical exercises for ${domainAnalysis.subject}.`,
-                subject: parsed.subject || domainAnalysis.subject,
-                cards: parsed.cards.map((c: Record<string, unknown>) => ({
-                  prompt: String(c.prompt ?? ''),
-                  answer: String(c.answer ?? ''),
-                  distractors: Array.isArray(c.distractors)
-                    ? c.distractors.map(String).slice(0, 3)
-                    : ['Option A', 'Option B', 'Option C'],
-                  acceptableAnswers: Array.isArray(c.acceptableAnswers)
-                    ? c.acceptableAnswers.map(String)
-                    : [String(c.answer ?? '')],
-                  hint: String(c.hint ?? ''),
-                  explanation: String(c.explanation ?? ''),
-                  conceptTag: String(c.conceptTag ?? domainAnalysis.subject),
-                  exerciseType:
-                    c.exerciseType === 'calculation' || c.exerciseType === 'worked-example'
-                      ? c.exerciseType
-                      : 'conceptual',
-                  formulaUsed: typeof c.formulaUsed === 'string' ? c.formulaUsed : '',
-                  workedSteps: Array.isArray(c.workedSteps)
-                    ? c.workedSteps.map(String).filter(Boolean)
-                    : [],
-                })),
+Return JSON matching:
+{
+  "title": "string",
+  "description": "string",
+  "subject": "string",
+  "cards": [
+    {
+      "prompt": "string",
+      "answer": "string",
+      "distractors": ["string", "string", "string"],
+      "acceptableAnswers": ["string"],
+      "hint": "string",
+      "explanation": "string",
+      "conceptTag": "string",
+      "exerciseType": "conceptual" | "calculation" | "worked-example" | "case-study" | "language-usage",
+      "formulaUsed": "string",
+      "workedSteps": ["string"]
+    }
+  ]
+}`,
+        });
+
+        rateLimitedFallback = synthesisRes.rateLimited;
+        builderModelUsed = synthesisRes.modelUsed;
+        const parsed = synthesisRes.data;
+
+        if (parsed && Array.isArray(parsed.cards) && parsed.cards.length > 0) {
+          const validKinds = new Set<ExerciseKind>([
+            'conceptual',
+            'calculation',
+            'worked-example',
+            'case-study',
+            'language-usage',
+          ]);
+          const defaultKind: ExerciseKind =
+            classification.domain === 'quantitative_stem'
+              ? 'calculation'
+              : classification.domain === 'applied_professional'
+                ? 'case-study'
+                : classification.domain === 'language_terminology'
+                  ? 'language-usage'
+                  : 'conceptual';
+
+          builtPayload = {
+            title: parsed.title || `${classification.subject} Practice`,
+            description:
+              parsed.description ||
+              `Verified ${parsed.cards.length} ${classification.language} study items (${DOMAIN_LABELS[classification.domain]}).`,
+            subject: parsed.subject || classification.subject,
+            cards: parsed.cards.map((c: Record<string, unknown>) => {
+              const rawKind = String(c.exerciseType ?? '');
+              const exerciseType = validKinds.has(rawKind as ExerciseKind)
+                ? (rawKind as ExerciseKind)
+                : defaultKind;
+              return {
+                prompt: String(c.prompt ?? ''),
+                answer: String(c.answer ?? ''),
+                distractors: Array.isArray(c.distractors)
+                  ? c.distractors.map(String).slice(0, 3)
+                  : ['Option A', 'Option B', 'Option C'],
+                acceptableAnswers: Array.isArray(c.acceptableAnswers)
+                  ? c.acceptableAnswers.map(String)
+                  : [String(c.answer ?? '')],
+                hint: String(c.hint ?? ''),
+                explanation: String(c.explanation ?? ''),
+                conceptTag: String(c.conceptTag ?? classification.subject),
+                exerciseType,
+                formulaUsed: typeof c.formulaUsed === 'string' ? c.formulaUsed : '',
+                workedSteps: Array.isArray(c.workedSteps)
+                  ? c.workedSteps.map(String).filter(Boolean)
+                  : [],
               };
-            }
-          }
-        } catch {
-          // Falls through cleanly to deterministic math/document builder
+            }),
+          };
         }
       }
 
       if (!builtPayload) {
-        const fallbackCards = domainAnalysis.isQuantHeavy
-          ? buildMathExercisesFromText(excerptText, count, domainAnalysis.subject)
-          : buildStudyItemsFromDocumentText(excerptText, 'quiz', count, domainAnalysis.subject);
+        const quantCards =
+          classification.domain === 'quantitative_stem'
+            ? buildMathExercisesFromText(excerptText, count, classification.subject)
+            : [];
+        const fallbackCards =
+          quantCards.length > 0
+            ? quantCards
+            : buildStudyItemsFromDocumentText(excerptText, 'quiz', count, classification.subject);
 
         if (fallbackCards.length === 0) {
           sendEvent('error', {
-            error:
-              'Could not extract enough structured problems from that input. Try adding more notes or choosing a specific math topic.',
+            error: rateLimitedFallback
+              ? buildFriendlyRateLimitMessage()
+              : 'Could not extract enough structured items from that input. Try uploading a clearer document or adding more detailed notes.',
           });
           return res.end();
         }
 
+        const isVi = classification.language === 'Vietnamese';
         builtPayload = {
-          title: `${domainAnalysis.subject} Practical Exercises`,
-          description: `Built ${fallbackCards.length} practical exercises with worked steps.`,
-          subject: domainAnalysis.subject,
+          title: isVi
+            ? `${classification.subject} · Luyện tập chuyên sâu`
+            : `${classification.subject} · Adaptive Practice`,
+          description: isVi
+            ? `Đã tổng hợp ${fallbackCards.length} câu hỏi có hướng dẫn từng bước từ tài liệu.`
+            : `Synthesized ${fallbackCards.length} study items with reasoning steps from your material.`,
+          subject: classification.subject,
           cards: fallbackCards.map((c) => ({
-            ...c,
-            exerciseType: c.exerciseType ?? (domainAnalysis.isQuantHeavy ? 'calculation' : 'conceptual'),
+            prompt: c.prompt,
+            answer: c.answer,
+            distractors: c.distractors,
+            acceptableAnswers: c.acceptableAnswers,
+            hint: c.hint,
+            explanation: c.explanation,
+            conceptTag: c.conceptTag,
+            exerciseType:
+              c.exerciseType ??
+              (classification.domain === 'quantitative_stem' ? 'calculation' : 'conceptual'),
             formulaUsed: c.formulaUsed ?? '',
             workedSteps: c.workedSteps ?? [c.explanation],
           })),
@@ -958,17 +1001,23 @@ Double-check every calculation step and verify that "answer" matches the final l
 
       sendEvent('agent-step', {
         agent: 'builder',
-        label: 'Calculation & Exercise Architect Agent',
-        status: 'done',
-        detail: `Verified ${builtPayload.cards.length} interactive exercises with step-by-step worked solutions.`,
+        label: 'Deep Synthesis & Verification Agent',
+        status: builderModelUsed ? 'done' : 'fallback',
+        detail: builderModelUsed
+          ? `Verified ${builtPayload.cards.length} ${classification.language} items via ${builderModelUsed} (strictly grounded in uploaded source).`
+          : rateLimitedFallback
+            ? `Rate limit encountered — built ${builtPayload.cards.length} ${classification.language} items using built-in multilingual document engine.`
+            : `Built ${builtPayload.cards.length} ${classification.language} items directly from document structure.`,
       });
 
       sendEvent('complete', {
         ...builtPayload,
         tool: 'agents',
-        isQuantHeavy: domainAnalysis.isQuantHeavy,
-        researchSources: researchSources.slice(0, 6),
-        pedagogicalPlan: domainAnalysis.pedagogicalPlan,
+        domain: classification.domain,
+        language: classification.language,
+        modelUsed: builderModelUsed ?? 'local-parser',
+        isQuantHeavy: classification.domain === 'quantitative_stem',
+        pedagogicalPlan: classification.pedagogicalStrategy,
       });
       return res.end();
     } catch (error) {
@@ -985,7 +1034,9 @@ Double-check every calculation step and verify that "answer" matches the final l
       const difficulty =
         typeof req.body?.difficulty === 'string' ? req.body.difficulty.trim() : 'Intermediate';
       const rawCount = Number(req.body?.count ?? 6);
-      const count = Number.isFinite(rawCount) ? Math.min(12, Math.max(3, Math.round(rawCount))) : 6;
+      const count = Number.isFinite(rawCount)
+        ? Math.min(12, Math.max(3, Math.round(rawCount)))
+        : 6;
 
       if (!topic && !notes) {
         return res.status(400).json({
@@ -993,118 +1044,116 @@ Double-check every calculation step and verify that "answer" matches the final l
         });
       }
 
-      const ai = getGeminiClient();
-      let quotaExhausted = false;
-      if (ai) {
+      const detectedLanguage = detectDocumentLanguage(`${topic}\n${notes}`);
+      let rateLimited = false;
+
+      if (modelRouter.hasConfiguredProvider()) {
         const sourceBlock = notes
-          ? `Base the quiz strictly on these student notes:\n"""\n${notes.slice(0, 8000)}\n"""${topic ? `\nFocus topic: ${topic}` : ''}`
+          ? `Base the quiz strictly on these student notes:\n"""\n${notes.slice(0, 12000)}\n"""${topic ? `\nFocus topic: ${topic}` : ''}`
           : `Topic: ${topic}`;
 
-        const result = await callGeminiWithFallback(ai, () => ({
-          contents: `Create a high-retention spaced-repetition interactive quiz deck with exactly ${count} cards at ${difficulty} level.
+        const result = await modelRouter.generateJson<{
+          title?: string;
+          description?: string;
+          subject?: string;
+          cards?: Array<Record<string, unknown>>;
+        }>({
+          tier: 'fast',
+          systemPrompt:
+            'You are a universal cognitive science educator crafting concise, accurate spaced-repetition quiz items across STEM, Humanities, Law, Medicine, and Languages. Output valid JSON only.',
+          userPrompt: `Create a high-retention spaced-repetition interactive quiz deck with exactly ${count} cards at ${difficulty} level.
 ${sourceBlock}
 
 Design rules for scientific spaced repetition (Minimum Information Principle):
 - Each prompt must test ONE atomic concept clearly, with no vague phrasing.
 - "answer" should be concise and unambiguous (1 to 8 words ideal so typed recall and flashcards work smoothly).
-- Provide exactly 3 plausible "distractors" that test real misconceptions rather than silly filler.
-- Provide 1-3 short "acceptableAnswers" aliases (e.g. abbreviations or phrasing variants).
-- Provide a gentle "hint" and a clear 1-2 sentence "explanation" reinforcing why the answer is right.`,
-          config: {
-            systemInstruction:
-              'You are an expert cognitive science educator crafting concise, accurate spaced-repetition quiz items.',
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                title: { type: Type.STRING, description: 'Clear 2-5 word deck title' },
-                description: { type: Type.STRING, description: '1 sentence summary of what the student will master' },
-                subject: { type: Type.STRING, description: 'Academic subject category' },
-                cards: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      prompt: { type: Type.STRING },
-                      answer: { type: Type.STRING },
-                      distractors: {
-                        type: Type.ARRAY,
-                        items: { type: Type.STRING },
-                      },
-                      acceptableAnswers: {
-                        type: Type.ARRAY,
-                        items: { type: Type.STRING },
-                      },
-                      hint: { type: Type.STRING },
-                      explanation: { type: Type.STRING },
-                      conceptTag: { type: Type.STRING },
-                    },
-                    required: [
-                      'prompt',
-                      'answer',
-                      'distractors',
-                      'acceptableAnswers',
-                      'hint',
-                      'explanation',
-                      'conceptTag',
-                    ],
-                  },
-                },
-              },
-              required: ['title', 'description', 'subject', 'cards'],
-            },
-          },
-        }));
+- Provide exactly 3 plausible "distractors" that test real misconceptions rather than filler.
+- Provide 1-3 short "acceptableAnswers" aliases.
+- Provide a gentle "hint" and a clear 1-2 sentence "explanation".
+- LANGUAGE MIRRORING: Write ALL fields strictly in ${detectedLanguage}.
 
-        quotaExhausted = result.quotaExhausted;
-        const rawText = (result.response?.text ?? '').trim();
-        if (rawText) {
-          try {
-            const parsed = JSON.parse(rawText);
-            if (parsed && Array.isArray(parsed.cards) && parsed.cards.length > 0) {
-              return res.json(parsed);
-            }
-          } catch {
-            // Fall through to deterministic fallback below if available
-          }
+Return JSON matching:
+{
+  "title": "string",
+  "description": "string",
+  "subject": "string",
+  "cards": [
+    {
+      "prompt": "string",
+      "answer": "string",
+      "distractors": ["string", "string", "string"],
+      "acceptableAnswers": ["string"],
+      "hint": "string",
+      "explanation": "string",
+      "conceptTag": "string"
+    }
+  ]
+}`,
+        });
+
+        rateLimited = result.rateLimited;
+        if (result.data && Array.isArray(result.data.cards) && result.data.cards.length > 0) {
+          return res.json({
+            ...result.data,
+            language: detectedLanguage,
+            modelUsed: result.modelUsed,
+          });
         }
       }
 
-      // Deterministic fallback when Gemini key is absent or daily quota is reached
+      // Deterministic fallback when GitHub Token is absent or rate-limited
       const combinedText = notes || topic;
       const mathSignal = detectMathDomainFromText(combinedText);
       if (mathSignal.isQuantHeavy) {
-        const mathCards = buildMathExercisesFromText(combinedText, count, topic || mathSignal.detectedTopics[0] || 'Mathematics');
+        const mathCards = buildMathExercisesFromText(
+          combinedText,
+          count,
+          topic || mathSignal.detectedTopics[0] || 'Mathematics'
+        );
         if (mathCards.length > 0) {
           return res.json({
             title: `${topic || mathSignal.detectedTopics[0] || 'Mathematics'} Practice`,
             description: `Generated ${mathCards.length} practical calculation exercises with worked steps.`,
             subject: mathSignal.detectedTopics[0] || 'Mathematics',
+            language: detectedLanguage,
             cards: mathCards,
           });
         }
       }
 
       if (notes && countWords(notes) >= 10) {
-        const docCards = buildStudyItemsFromDocumentText(notes, 'quiz', count, topic || 'Study Notes');
+        const docCards = buildStudyItemsFromDocumentText(
+          notes,
+          'quiz',
+          count,
+          topic || (detectedLanguage === 'Vietnamese' ? 'Ghi chú học tập' : 'Study Notes')
+        );
         if (docCards.length > 0) {
           return res.json({
-            title: `${topic || 'Study Notes'} Quiz`,
-            description: `Extracted ${docCards.length} active-recall cards from your study notes.`,
-            subject: topic || 'Study Notes',
+            title:
+              detectedLanguage === 'Vietnamese'
+                ? `${topic || 'Ghi chú học tập'} · Ôn tập`
+                : `${topic || 'Study Notes'} Quiz`,
+            description:
+              detectedLanguage === 'Vietnamese'
+                ? `Đã trích xuất ${docCards.length} câu hỏi ghi nhớ chủ động từ ghi chú.`
+                : `Extracted ${docCards.length} active-recall cards from your study notes.`,
+            subject: topic || (detectedLanguage === 'Vietnamese' ? 'Ghi chú' : 'Study Notes'),
+            language: detectedLanguage,
             cards: docCards,
           });
         }
       }
 
-      return res.status(quotaExhausted || ai ? 429 : 503).json({
-        error: quotaExhausted
-          ? buildFriendlyQuotaMessage()
-          : 'Gemini API key is not configured in Secrets yet. You can upload a document, paste detailed notes, or build custom decks manually.',
+      return res.status(rateLimited ? 429 : 503).json({
+        error: rateLimited
+          ? buildFriendlyRateLimitMessage()
+          : 'GitHub Models token (GITHUB_TOKEN) is not configured yet. You can upload a document, paste detailed notes, or build custom decks manually.',
       });
     } catch {
-      return res.status(500).json({ error: 'Could not generate quiz right now. Please try pasting notes or uploading a study file.' });
+      return res.status(500).json({
+        error: 'Could not generate quiz right now. Please try pasting notes or uploading a study file.',
+      });
     }
   });
 
@@ -1113,41 +1162,40 @@ Design rules for scientific spaced repetition (Minimum Information Principle):
       const interest =
         typeof req.body?.interest === 'string' && req.body.interest.trim()
           ? req.body.interest.trim()
-          : 'university science, languages, and creative learning';
+          : 'sciences, humanities, law, languages, and creative learning';
 
-      const ai = getGeminiClient();
-      if (!ai) {
+      if (!modelRouter.hasConfiguredProvider()) {
         return res.json({ ideas: [] });
       }
 
-      const { response } = await callGeminiWithFallback(ai, () => ({
-        contents: `Suggest 4 imaginative, high-yield spaced-repetition quiz deck ideas tailored to: "${interest}".`,
-        config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                title: { type: Type.STRING },
-                subject: { type: Type.STRING },
-                promptTopic: { type: Type.STRING },
-                whyItWorks: { type: Type.STRING },
-              },
-              required: ['title', 'subject', 'promptTopic', 'whyItWorks'],
-            },
-          },
-        },
-      }));
+      const detectedLanguage = detectDocumentLanguage(interest);
+      const { data } = await modelRouter.generateJson<{
+        ideas?: unknown[];
+      }>({
+        tier: 'fast',
+        maxTokens: 700,
+        systemPrompt:
+          'You suggest high-yield spaced-repetition quiz deck ideas across all academic domains. Output valid JSON object {"ideas": [...]} only.',
+        userPrompt: `Suggest 4 imaginative, high-yield spaced-repetition quiz deck ideas tailored to: "${interest}". Write in ${detectedLanguage}.
+Return JSON:
+{
+  "ideas": [
+    {
+      "title": "string",
+      "subject": "string",
+      "promptTopic": "string",
+      "whyItWorks": "string"
+    }
+  ]
+}`,
+      });
 
-      const rawText = (response?.text ?? '').trim();
-      if (!rawText) {
-        return res.json({ ideas: [] });
-      }
-
-      const ideas = JSON.parse(rawText);
-      return res.json({ ideas: Array.isArray(ideas) ? ideas : [] });
+      const ideas = Array.isArray(data)
+        ? data
+        : data && Array.isArray(data.ideas)
+          ? data.ideas
+          : [];
+      return res.json({ ideas });
     } catch {
       return res.json({ ideas: [] });
     }

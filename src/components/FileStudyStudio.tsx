@@ -6,9 +6,9 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
-  ExternalLink,
   FileText,
   Files,
+  Globe,
   Layers,
   Loader2,
   Play,
@@ -23,6 +23,7 @@ import type {
   QuizDeck,
   QuizMode,
   ResearchSource,
+  StudyDomain,
 } from '../types/quiz';
 import { runAgentQuizStream } from '../utils/agentStreamClient';
 import { formatFileSize, type DocumentSection } from '../utils/documentParser';
@@ -38,6 +39,7 @@ interface ExtractedFileResponse {
   fileSizeBytes?: number;
   wordCount: number;
   pageCount: number | null;
+  detectedLanguage?: string;
   extractedText: string;
   isPreviewTruncated?: boolean;
   sections: DocumentSection[];
@@ -54,6 +56,8 @@ interface GeneratedStudyPayload {
   description: string;
   subject: string;
   tool: 'flashcards' | 'quiz' | 'agents';
+  domain?: StudyDomain;
+  language?: string;
   source?: string;
   pedagogicalPlan?: string;
   researchSources?: ResearchSource[];
@@ -92,6 +96,16 @@ Integration by Parts: ∫ u dv = u*v - ∫ v du.
 2x2 Matrix Determinant: det([[a, b], [c, d]]) = ad - bc.
 Eigenvalue Equation: det(A - λI) = 0 solves for scalar eigenvalues λ of square matrix A.
 Dot Product: u · v = u1*v1 + u2*v2 + ... + un*vn measures projection alignment.`;
+
+const SAMPLE_VIETNAMESE_HUMANITIES = `# Chương 1: Chủ nghĩa duy vật biện chứng và Nhận thức luận
+Chủ nghĩa duy vật biện chứng: Học thuyết khẳng định vật chất là tính thứ nhất, tồn tại khách quan độc lập với ý thức và quyết định ý thức con người.
+Thực tiễn: Toàn bộ hoạt động vật chất cảm tính có mục đích, mang tính lịch sử - xã hội của con người nhằm cải tạo tự nhiên và xã hội.
+Vai trò của thực tiễn: Thực tiễn là cơ sở, động lực, mục đích của nhận thức và là tiêu chuẩn duy nhất để kiểm tra chân lý khách quan.
+
+# Chương 2: Các quy luật cơ bản của Phép biện chứng
+Quy luật lượng - chất: Sự tích lũy dần về lượng khi vượt quá điểm nút sẽ dẫn đến bước nhảy vọt làm thay đổi căn bản về chất của sự vật.
+Quy luật mâu thuẫn: Sự đấu tranh và thống nhất giữa các mặt đối lập là nguồn gốc, động lực bên trong của mọi sự vận động và phát triển.
+Phủ định biện chứng: Sự phủ định tạo tiền đề cho cái mới ra đời trên cơ sở kế thừa có chọn lọc những hạt nhân hợp lý của cái cũ.`;
 
 export const FileStudyStudio: React.FC<FileStudyStudioProps> = ({ onSaveDeck }) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -326,6 +340,16 @@ export const FileStudyStudio: React.FC<FileStudyStudioProps> = ({ onSaveDeck }) 
     void processIncomingFiles([mathFile]);
   };
 
+  const handleTrySampleVietnamese = () => {
+    const viFile = new File(
+      [SAMPLE_VIETNAMESE_HUMANITIES],
+      'triet_hoc_duy_vat_bien_chung.md',
+      { type: 'text/markdown' }
+    );
+    setSelectedTool('agents');
+    void processIncomingFiles([viFile]);
+  };
+
   const handleTrySampleBundle = () => {
     const notesFile = new File([SAMPLE_LECTURE_NOTES], 'neurobiology_lecture_notes.md', {
       type: 'text/markdown',
@@ -468,8 +492,9 @@ export const FileStudyStudio: React.FC<FileStudyStudioProps> = ({ onSaveDeck }) 
       title: generated.title,
       description: generated.description,
       subject: generated.subject,
+      domain: generated.domain,
+      language: generated.language,
       createdAt: now.toISOString(),
-      researchSources: generated.researchSources,
       cards: generated.cards.map((d, idx) =>
         createNewCard(
           {
@@ -525,11 +550,20 @@ export const FileStudyStudio: React.FC<FileStudyStudioProps> = ({ onSaveDeck }) 
               Step 1 · Read One or Multiple Study Files
             </h2>
             <p className="mt-0.5 text-sm text-[#4E5E4B]">
-              Upload several PDF, Word (.docx), Markdown (.md), Text (.txt), CSV, or JSON files at
-              once — large volumes stream in chunks automatically with no 12 MB ceiling.
+              Upload several PDF, Word (.docx), PowerPoint (.pptx), Markdown (.md), Text (.txt), CSV,
+              or JSON files at once — large multilingual volumes stream in chunks with no 12 MB ceiling.
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={handleTrySampleVietnamese}
+              disabled={isExtracting}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-[#E6D5DC] bg-[#FFF8FA] px-3.5 py-2 text-xs font-semibold text-[#9D3E63] transition-colors hover:bg-[#FCEFF4] whitespace-nowrap shrink-0"
+            >
+              <Globe className="h-3.5 w-3.5" />
+              Load Sample Humanities (VI)
+            </button>
             <button
               type="button"
               onClick={handleTrySampleMath}
@@ -543,7 +577,7 @@ export const FileStudyStudio: React.FC<FileStudyStudioProps> = ({ onSaveDeck }) 
               type="button"
               onClick={handleTrySampleFile}
               disabled={isExtracting}
-              className="inline-flex items-center gap-1.5 rounded-xl border border-[#E6D5DC] bg-[#FFF8FA] px-3.5 py-2 text-xs font-semibold text-[#9D3E63] transition-colors hover:bg-[#FCEFF4] whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-1.5 rounded-xl border border-[#D4DFC7] bg-[#FAFDF7] px-3.5 py-2 text-xs font-semibold text-[#2C3A2B] transition-colors hover:bg-[#EFF5E7] whitespace-nowrap shrink-0"
             >
               <FileText className="h-3.5 w-3.5" />
               Load Sample Notes (.md)
@@ -578,7 +612,7 @@ export const FileStudyStudio: React.FC<FileStudyStudioProps> = ({ onSaveDeck }) 
             htmlFor="study-file-upload"
             className="mt-3 cursor-pointer text-sm font-semibold text-[#1F2A1E]"
           >
-            Drop one or multiple PDF, DOCX, TXT, MD, CSV, or JSON files here, or{' '}
+            Drop one or multiple PDF, DOCX, PPTX, TXT, MD, CSV, or JSON files here, or{' '}
             <span className="text-[#2F855A] underline">browse from device</span>
           </label>
           <input
@@ -586,7 +620,7 @@ export const FileStudyStudio: React.FC<FileStudyStudioProps> = ({ onSaveDeck }) 
             id="study-file-upload"
             type="file"
             multiple
-            accept=".pdf,.docx,.txt,.md,.csv,.json"
+            accept=".pdf,.docx,.pptx,.txt,.md,.csv,.json"
             onChange={handleFileChange}
             className="sr-only"
           />
@@ -685,8 +719,12 @@ export const FileStudyStudio: React.FC<FileStudyStudioProps> = ({ onSaveDeck }) 
                       <p className="text-xs text-[#5A6B57] tabular-nums">
                         {doc.fileType} · {formatFileSize(doc.fileSizeBytes)} ·{' '}
                         {doc.wordCount.toLocaleString()} words
-                        {doc.pageCount ? ` · ${doc.pageCount} pages` : ''} · {doc.sections.length}{' '}
+                        {doc.pageCount
+                          ? ` · ${doc.pageCount} ${doc.fileType === 'PPTX' ? 'slides' : 'pages'}`
+                          : ''}{' '}
+                        · {doc.sections.length}{' '}
                         {doc.sections.length === 1 ? 'section' : 'sections'}
+                        {doc.detectedLanguage ? ` · ${doc.detectedLanguage}` : ''}
                       </p>
                     </div>
 
@@ -820,15 +858,15 @@ export const FileStudyStudio: React.FC<FileStudyStudioProps> = ({ onSaveDeck }) 
                 <div className="flex-1">
                   <div className="flex items-center justify-between gap-2">
                     <span className="font-display text-base font-semibold text-[#1F2A1E]">
-                      AI Agents · Math & Exercises
+                      AI Agents · Deep Synthesis & Practice
                     </span>
                     {selectedTool === 'agents' && (
                       <Check className="h-4 w-4 text-[#2F855A] shrink-0" />
                     )}
                   </div>
                   <p className="mt-1 text-xs leading-relaxed text-[#4E5E4B]">
-                    Runs Analyzer + Google Search + Calculation Verifier agents to build
-                    practical math drills with step-by-step worked solutions.
+                    Classifies STEM, Humanities, Applied Case, or Language material, mirrors your
+                    document language, and builds verified drills with reasoning steps.
                   </p>
                 </div>
               </button>
@@ -988,29 +1026,6 @@ export const FileStudyStudio: React.FC<FileStudyStudioProps> = ({ onSaveDeck }) 
                   </div>
                 ))}
               </div>
-
-              {agentSources.length > 0 && (
-                <div className="border-t border-[#DCE8D3] pt-2.5">
-                  <p className="text-xs font-semibold text-[#3B5940]">
-                    Grounded Search Sources Consulted
-                  </p>
-                  <ul className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1">
-                    {agentSources.map((src) => (
-                      <li key={src.url}>
-                        <a
-                          href={src.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1 text-xs font-medium text-[#2F855A] underline hover:text-[#1D593A]"
-                        >
-                          {src.title}
-                          <ExternalLink className="h-3 w-3" />
-                        </a>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
             </div>
           )}
 
@@ -1038,9 +1053,10 @@ export const FileStudyStudio: React.FC<FileStudyStudioProps> = ({ onSaveDeck }) 
                 {generated.tool === 'flashcards'
                   ? 'Flashcard Deck'
                   : generated.tool === 'agents'
-                  ? 'AI-Agent Practical Exercises'
+                  ? 'AI-Agent Adaptive Study Set'
                   : 'Interactive Quiz'}{' '}
                 · {generated.cards.length} items ready
+                {generated.language ? ` · ${generated.language}` : ''}
               </p>
               <h3 className="mt-1 font-display text-2xl font-bold text-[#1F2A1E]">
                 {generated.title}
@@ -1065,7 +1081,7 @@ export const FileStudyStudio: React.FC<FileStudyStudioProps> = ({ onSaveDeck }) 
                 {generated.tool === 'flashcards'
                   ? 'Study Flashcards Now'
                   : generated.tool === 'agents'
-                  ? 'Launch Practical Exercises'
+                  ? 'Launch Adaptive Practice'
                   : 'Start Interactive Quiz'}
               </button>
             </div>

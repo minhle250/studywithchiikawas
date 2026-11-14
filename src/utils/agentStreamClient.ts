@@ -1,10 +1,18 @@
-import type { AgentTraceStep, GeneratedCardDraft, ResearchSource } from '../types/quiz';
+import type {
+  AgentTraceStep,
+  GeneratedCardDraft,
+  ResearchSource,
+  StudyDomain,
+} from '../types/quiz';
 
 export interface AgentQuizResult {
   title: string;
   description: string;
   subject: string;
   tool: 'agents';
+  domain?: StudyDomain;
+  language?: string;
+  modelUsed?: string;
   isQuantHeavy?: boolean;
   pedagogicalPlan?: string;
   researchSources?: ResearchSource[];

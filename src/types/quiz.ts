@@ -26,7 +26,18 @@ export type SoundMilestone =
   | 'encourage_again'
   | 'quiz_generated';
 
-export type ExerciseKind = 'conceptual' | 'calculation' | 'worked-example';
+export type StudyDomain =
+  | 'quantitative_stem'
+  | 'social_humanities'
+  | 'applied_professional'
+  | 'language_terminology';
+
+export type ExerciseKind =
+  | 'conceptual'
+  | 'calculation'
+  | 'worked-example'
+  | 'case-study'
+  | 'language-usage';
 
 export interface ResearchSource {
   title: string;
@@ -34,7 +45,7 @@ export interface ResearchSource {
 }
 
 export interface AgentTraceStep {
-  agent: 'analyzer' | 'search' | 'builder';
+  agent: 'classifier' | 'builder' | 'analyzer' | 'search';
   label: string;
   status: 'running' | 'done' | 'fallback';
   detail: string;
@@ -66,6 +77,8 @@ export interface QuizDeck {
   title: string;
   description: string;
   subject: string;
+  domain?: StudyDomain;
+  language?: string;
   createdAt: string;
   cards: QuizCard[];
   researchSources?: ResearchSource[];

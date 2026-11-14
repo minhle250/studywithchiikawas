@@ -97,6 +97,7 @@ export default function App() {
   const [sessionInitialMode, setSessionInitialMode] = useState<QuizMode>('mixed');
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [heroImgFailed, setHeroImgFailed] = useState(false);
+  const [cloverImgFailed, setCloverImgFailed] = useState(false);
 
   useEffect(() => {
     try {
@@ -434,7 +435,7 @@ export default function App() {
                       className="inline-flex items-center gap-2 rounded-xl border border-[#E6D5DC] bg-[#FFF8FA] px-5 py-3 text-sm font-semibold text-[#1F2A1E] transition-colors hover:bg-[#FCEFF4] whitespace-nowrap shrink-0"
                     >
                       <FileUp className="h-4 w-4 text-[#A2496B]" />
-                      Read PDF / DOCX
+                      Read Files / Slides
                     </button>
 
                     <button
@@ -585,12 +586,19 @@ export default function App() {
 
               {decks.length === 0 ? (
                 <div className="flex flex-col items-center justify-center rounded-3xl border border-dashed border-[#C7D6B9] bg-white/90 px-6 py-12 text-center">
-                  <img
-                    src={CLOVER_EMBLEM_SRC}
-                    alt="Four-leaf clover beside a study notebook"
-                    referrerPolicy="no-referrer"
-                    className="h-28 w-28 rounded-2xl object-cover"
-                  />
+                  {!cloverImgFailed ? (
+                    <img
+                      src={CLOVER_EMBLEM_SRC}
+                      alt="Four-leaf clover beside a study notebook"
+                      referrerPolicy="no-referrer"
+                      onError={() => setCloverImgFailed(true)}
+                      className="h-28 w-28 rounded-2xl object-cover"
+                    />
+                  ) : (
+                    <div className="flex h-28 w-28 items-center justify-center rounded-2xl bg-gradient-to-br from-[#ECF8F0] to-[#FCE7EF] text-xs font-semibold text-[#2F855A]">
+                      KusaQuiz
+                    </div>
+                  )}
                   <h3 className="mt-4 font-display text-xl font-semibold text-[#1F2A1E]">
                     Your meadow has room to grow
                   </h3>

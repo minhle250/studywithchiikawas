@@ -34,7 +34,20 @@ test('detectMathDomainFromText identifies calculus and linear algebra topics', (
   assert.ok(signal.detectedTopics.includes('Linear Algebra'));
 });
 
-test('buildMathExercisesFromText generates calculation drills with worked steps', () => {
+test('detectMathDomainFromText and buildMathExercisesFromText do not inject Calculus into humanities/law texts', () => {
+  const humanitiesText = `# Triết học và Lịch sử
+  Chủ nghĩa duy vật biện chứng nhấn mạnh giới hạn lịch sử của nhận thức và sức mạnh thực tiễn xã hội.
+  Social forces and constitutional limits shaped nineteenth-century political economy.`;
+
+  const signal = detectMathDomainFromText(humanitiesText);
+  assert.equal(signal.isQuantHeavy, false);
+  assert.deepEqual(signal.detectedTopics, []);
+
+  const drills = buildMathExercisesFromText(humanitiesText, 5, 'Humanities');
+  assert.equal(drills.length, 0);
+});
+
+test('buildMathExercisesFromText generates calculation drills with clean Unicode symbols for quant docs', () => {
   const notes = `# Calculus & Linear Algebra
 Power Rule: d/dx[x^n] = n*x^(n-1)
 Matrix Determinant: det(A) = ad - bc`;

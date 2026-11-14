@@ -2,7 +2,6 @@ import React, { useState } from 'react';
 import {
   Bot,
   Check,
-  ExternalLink,
   Lightbulb,
   Loader2,
   Play,
@@ -332,7 +331,7 @@ export const QuizGenerator: React.FC<QuizGeneratorProps> = ({
                 : 'text-[#4E5E4B] hover:text-[#1F2A1E]'
             }`}
           >
-            Read Files (PDF / DOCX)
+            Read Files (PDF / DOCX / PPTX)
           </button>
           <button
             type="button"
@@ -384,7 +383,7 @@ export const QuizGenerator: React.FC<QuizGeneratorProps> = ({
                 type="text"
                 value={topic}
                 onChange={(e) => setTopic(e.target.value)}
-                placeholder="e.g., Photosynthesis Light Reactions, Japanese JLPT N5 Verbs, Linear Algebra Eigenvalues"
+                placeholder="e.g., Triết học Mác - Lênin, Constitutional Law, JLPT N5 Verbs, Linear Algebra"
                 className="mt-1.5 w-full rounded-xl border border-[#CBD8BE] bg-[#FCFDF9] px-4 py-2.5 text-sm text-[#1F2A1E] placeholder:text-[#8E9C8B] focus:border-[#2F855A] focus:outline-none"
               />
             </div>
@@ -474,7 +473,7 @@ export const QuizGenerator: React.FC<QuizGeneratorProps> = ({
                   ) : (
                     <>
                       <Bot className="h-3.5 w-3.5" />
-                      AI Agents · Math & Search
+                      AI Agents · Deep Synthesis
                     </>
                   )}
                 </button>
@@ -519,23 +518,6 @@ export const QuizGenerator: React.FC<QuizGeneratorProps> = ({
                     </div>
                   </div>
                 ))}
-                {agentSources.length > 0 && (
-                  <ul className="flex flex-wrap gap-x-4 gap-y-1 border-t border-[#DCE8D3] pt-2">
-                    {agentSources.map((src) => (
-                      <li key={src.url}>
-                        <a
-                          href={src.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1 text-xs font-medium text-[#2F855A] underline"
-                        >
-                          {src.title}
-                          <ExternalLink className="h-3 w-3" />
-                        </a>
-                      </li>
-                    ))}
-                  </ul>
-                )}
               </div>
             )}
           </form>

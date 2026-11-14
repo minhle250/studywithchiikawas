@@ -190,13 +190,41 @@ export interface MathDomainSignal {
 }
 
 const MATH_SIGNAL_KEYWORDS: Array<{ pattern: RegExp; topic: string }> = [
-  { pattern: /\b(derivative|integral|differenti|antiderivative|calculus|limit|taylor|series)\b/i, topic: 'Calculus' },
-  { pattern: /\b(matrix|matrices|eigenvalue|eigenvector|determinant|linear algebra|vector space|dot product)\b/i, topic: 'Linear Algebra' },
-  { pattern: /\b(probability|variance|standard deviation|bayes|distribution|expectation|hypothesis|p-value)\b/i, topic: 'Probability & Statistics' },
-  { pattern: /\b(equation|polynomial|quadratic|logarithm|exponential|trigonometr|sin|cos|slope|intercept)\b/i, topic: 'Algebra & Functions' },
-  { pattern: /\b(differential equation|laplace|fourier|ode|pde|gradient|divergence)\b/i, topic: 'Differential Equations' },
-  { pattern: /\b(complexity|big-o|recurrence|algorithm|dynamic programming|binary search|graph)\b/i, topic: 'Algorithms & Discrete Math' },
-  { pattern: /\b(molarity|stoichiometry|enthalpy|kinetic|velocity|acceleration|force|ohm|voltage)\b/i, topic: 'Quantitative Science' },
+  {
+    pattern:
+      /\b(derivative|integral|differenti|antiderivative|calculus|taylor series|tích phân|đạo hàm|giới hạn hàm số)\b/i,
+    topic: 'Calculus',
+  },
+  {
+    pattern:
+      /\b(matrix|matrices|eigenvalue|eigenvector|determinant|linear algebra|vector space|dot product|ma trận|định thức|vectơ)\b/i,
+    topic: 'Linear Algebra',
+  },
+  {
+    pattern:
+      /\b(probability|variance|standard deviation|bayes|probability distribution|expectation|hypothesis test|p-value|xác suất|phương sai|độ lệch chuẩn)\b/i,
+    topic: 'Probability & Statistics',
+  },
+  {
+    pattern:
+      /\b(quadratic equation|polynomial|logarithm|exponential|trigonometr|slope-intercept|phương trình bậc hai|logarit)\b/i,
+    topic: 'Algebra & Functions',
+  },
+  {
+    pattern:
+      /\b(differential equation|laplace transform|fourier transform|ode|pde|divergence theorem|phương trình vi phân)\b/i,
+    topic: 'Differential Equations',
+  },
+  {
+    pattern:
+      /\b(time complexity|big-o|recurrence relation|dynamic programming|binary search|graph theory|thuật toán|độ phức tạp)\b/i,
+    topic: 'Algorithms & Discrete Math',
+  },
+  {
+    pattern:
+      /\b(molarity|stoichiometry|enthalpy|kinetic energy|acceleration|newton|ohm's law|voltage|động năng|cường độ dòng điện)\b/i,
+    topic: 'Quantitative Science',
+  },
 ];
 
 export function detectMathDomainFromText(text: string): MathDomainSignal {
@@ -211,13 +239,13 @@ export function detectMathDomainFromText(text: string): MathDomainSignal {
     }
   }
 
-  // Also count formula/equation/symbol density (=, ∫, ∑, ^, dx, dy, fractions)
-  const symbolMatches = text.match(/[=+\-*/^∫∑√πλΔ]/g)?.length ?? 0;
+  // Count math-specific operators/symbols (excluding hyphens inside ordinary prose)
+  const symbolMatches = text.match(/[=+*/^∫∑√πλΔ]|(\d+\s*-\s*\d+)/g)?.length ?? 0;
   const equationDensity = symbolMatches / Math.max(1, text.length / 100);
 
-  const score = Math.min(1, matchedTopics.length * 0.28 + (equationDensity > 1.2 ? 0.3 : 0));
+  const score = Math.min(1, matchedTopics.length * 0.32 + (equationDensity > 1.2 ? 0.3 : 0));
   return {
-    isQuantHeavy: matchedTopics.length > 0 || equationDensity > 1.8,
+    isQuantHeavy: matchedTopics.length > 0 || equationDensity > 2.2,
     confidence: Number(score.toFixed(2)),
     detectedTopics: matchedTopics,
   };
@@ -225,7 +253,8 @@ export function detectMathDomainFromText(text: string): MathDomainSignal {
 
 /**
  * Deterministic math/calculation practice generator fallback when AI is offline.
- * Extracts formulas and generates numerical/procedural calculation drills with worked steps.
+ * Strictly returns [] for non-quantitative documents so Calculus/Matrix drills
+ * never leak into Humanities, Law, Medicine, or Language study decks.
  */
 export function buildMathExercisesFromText(
   rawText: string,
@@ -233,14 +262,18 @@ export function buildMathExercisesFromText(
   subjectHint: string = 'Applied Mathematics'
 ): GeneratedCardDraft[] {
   const signal = detectMathDomainFromText(rawText);
+  if (!signal.isQuantHeavy) {
+    return [];
+  }
+
   const exercises: GeneratedCardDraft[] = [];
 
-  // Cap formula-recognition items to <= 25% of deck so hands-on numerical calculations dominate
+  // Cap formula-recognition items to <= 25% of deck so hands-on calculations dominate
   const maxFormulaCards = Math.max(1, Math.floor(count * 0.25));
   const lines = rawText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   for (const line of lines) {
     if (exercises.length >= maxFormulaCards) break;
-    const eq = /^([A-Za-z0-9\s'()-]{2,42})\s*[:–—-]\s*([^:]{3,90}=[^:]{1,90})$/.exec(line);
+    const eq = /^([\p{L}\p{N}\s'()-]{2,42})\s*[:–—-]\s*([^:]{3,90}=[^:]{1,90})$/u.exec(line);
     if (eq) {
       const label = eq[1].trim();
       const formula = eq[2].trim();
@@ -267,11 +300,11 @@ export function buildMathExercisesFromText(
     }
   }
 
-  // Add concrete, verified calculation drills calibrated to detected quantitative domains
+  // Only add verified calculation templates for explicitly detected math topics
   const topicSet = new Set(signal.detectedTopics);
   const templateBank: GeneratedCardDraft[] = [];
 
-  if (topicSet.has('Calculus') || exercises.length < count) {
+  if (topicSet.has('Calculus')) {
     templateBank.push(
       {
         prompt: 'Compute the definite integral ∫₀² (3x² + 2x) dx.',
@@ -279,7 +312,8 @@ export function buildMathExercisesFromText(
         distractors: ['10', '14', '8'],
         acceptableAnswers: ['12', '12.0'],
         hint: 'Find the antiderivative x³ + x² first, then evaluate from x = 0 to x = 2.',
-        explanation: 'Using the Power Rule for integration, ∫(3x² + 2x)dx = x³ + x². Evaluating [2³ + 2²] - [0] = 8 + 4 = 12.',
+        explanation:
+          'Using the Power Rule for integration, ∫(3x² + 2x)dx = x³ + x². Evaluating [2³ + 2²] - [0] = 8 + 4 = 12.',
         conceptTag: 'Definite Integration',
         exerciseType: 'calculation',
         formulaUsed: '∫ xⁿ dx = xⁿ⁺¹ / (n + 1)',
@@ -290,12 +324,13 @@ export function buildMathExercisesFromText(
         ],
       },
       {
-        prompt: 'Evaluate the derivative f\'(3) for f(x) = 2x³ - 5x + 7.',
+        prompt: "Evaluate the derivative f'(3) for f(x) = 2x³ - 5x + 7.",
         answer: '49',
         distractors: ['54', '44', '39'],
         acceptableAnswers: ['49'],
-        hint: 'Differentiate term-by-term to get f\'(x) = 6x² - 5, then substitute x = 3.',
-        explanation: 'Power Rule gives f\'(x) = 6x² - 5. At x = 3, f\'(3) = 6(9) - 5 = 54 - 5 = 49.',
+        hint: "Differentiate term-by-term to get f'(x) = 6x² - 5, then substitute x = 3.",
+        explanation:
+          "Power Rule gives f'(x) = 6x² - 5. At x = 3, f'(3) = 6(9) - 5 = 54 - 5 = 49.",
         conceptTag: 'Differentiation Practice',
         exerciseType: 'calculation',
         formulaUsed: 'd/dx [xⁿ] = n·xⁿ⁻¹',
@@ -308,7 +343,7 @@ export function buildMathExercisesFromText(
     );
   }
 
-  if (topicSet.has('Linear Algebra') || exercises.length < count) {
+  if (topicSet.has('Linear Algebra')) {
     templateBank.push(
       {
         prompt: 'Compute the determinant of the 2×2 matrix [[4, 3], [2, 5]].',
@@ -345,14 +380,16 @@ export function buildMathExercisesFromText(
     );
   }
 
-  if (topicSet.has('Probability & Statistics') || exercises.length < count) {
+  if (topicSet.has('Probability & Statistics')) {
     templateBank.push({
-      prompt: 'A fair 6-sided die is rolled twice. What is the probability that the sum equals 7? (Give fraction or decimal)',
+      prompt:
+        'A fair 6-sided die is rolled twice. What is the probability that the sum equals 7? (Give fraction or decimal)',
       answer: '1/6',
       distractors: ['1/12', '7/36', '1/3'],
       acceptableAnswers: ['1/6', '6/36', '0.167'],
       hint: 'Count how many pairs (a, b) out of 36 satisfy a + b = 7.',
-      explanation: 'There are 6 favorable outcomes: (1,6), (2,5), (3,4), (4,3), (5,2), (6,1) out of 36 total pairs = 6/36 = 1/6.',
+      explanation:
+        'There are 6 favorable outcomes: (1,6), (2,5), (3,4), (4,3), (5,2), (6,1) out of 36 total pairs = 6/36 = 1/6.',
       conceptTag: 'Discrete Probability',
       exerciseType: 'worked-example',
       formulaUsed: 'P(E) = |E| / |Ω|',
@@ -364,14 +401,16 @@ export function buildMathExercisesFromText(
     });
   }
 
-  if (topicSet.has('Algorithms & Discrete Math') || exercises.length < count) {
+  if (topicSet.has('Algorithms & Discrete Math')) {
     templateBank.push({
-      prompt: 'How many comparisons at most does binary search perform on a sorted array of 1,024 elements? (⌈log₂(N+1)⌉)',
+      prompt:
+        'How many comparisons at most does binary search perform on a sorted array of 1,024 elements? (⌈log₂(N+1)⌉)',
       answer: '11',
       distractors: ['10', '32', '512'],
       acceptableAnswers: ['11', '10'],
       hint: 'Recall 2¹⁰ = 1,024, so log₂(1025) sits just above 10.',
-      explanation: 'At each step binary search halves the search range. Since 2¹⁰ = 1024 < 1025 ≤ 2¹¹, at most 11 comparisons are needed.',
+      explanation:
+        'At each step binary search halves the search range. Since 2¹⁰ = 1024 < 1025 ≤ 2¹¹, at most 11 comparisons are needed.',
       conceptTag: 'Algorithmic Complexity',
       exerciseType: 'calculation',
       formulaUsed: 'T(n) ≤ ⌈log₂(n + 1)⌉',
